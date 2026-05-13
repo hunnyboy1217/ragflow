@@ -498,6 +498,14 @@ def _assert_bad_request(res, expected_substring):
     assert expected_substring in payload["message"], payload
 
 
+def _assert_status(res, expected_code, expected_substring):
+    assert isinstance(res, tuple), res
+    payload, code = res
+    assert code == expected_code, res
+    assert payload["code"] == expected_code, payload
+    assert expected_substring in payload["message"], payload
+
+
 @pytest.mark.p2
 def test_agents_crud_unit_branches(monkeypatch):
     module = _load_agents_app(monkeypatch)
@@ -653,7 +661,22 @@ def test_webhook_security_dispatch(monkeypatch):
         _DummyRequest(headers={"Content-Type": "application/json"}, json_body={}, args={"a": "b"}),
     )
 
+    # Secure-by-default: empty security_cfg and auth_type=="none" without
+    # allow_anonymous must be rejected with 401.
     for security in ({}, {"auth_type": "none"}):
+        cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=security))
+        monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id, _cvs=cvs: (True, _cvs))
+        _assert_status(
+            _run(module.webhook("agent-1")),
+            module.RetCode.UNAUTHORIZED,
+            "explicit security configuration",
+        )
+
+    # Explicit anonymous opt-in is allowed.
+    for security in (
+        {"allow_anonymous": True},
+        {"auth_type": "none", "allow_anonymous": True},
+    ):
         cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=security))
         monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id, _cvs=cvs: (True, _cvs))
         res = _run(module.webhook("agent-1"))
@@ -662,7 +685,93 @@ def test_webhook_security_dispatch(monkeypatch):
 
     cvs = _make_webhook_cvs(module, params=_default_webhook_params(security={"auth_type": "unsupported"}))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
-    _assert_bad_request(_run(module.webhook("agent-1")), "Unsupported auth_type")
+    _assert_status(
+        _run(module.webhook("agent-1")),
+        module.RetCode.UNAUTHORIZED,
+        "Unsupported auth_type",
+    )
+
+
+@pytest.mark.p2
+def test_webhook_test_route_requires_login_and_ownership(monkeypatch):
+    """/webhook/test must require an authenticated session bound to the canvas owner."""
+    module = _load_agents_app(monkeypatch)
+    _patch_background_task(monkeypatch, module)
+
+    monkeypatch.setattr(
+        module,
+        "request",
+        _DummyRequest(
+            path="/api/v1/agents/agent-1/webhook/test",
+            headers={"Content-Type": "application/json"},
+            json_body={},
+        ),
+    )
+
+    # Unauthenticated invocation of /webhook/test → 401, even before any
+    # canvas/security lookup runs.
+    monkeypatch.setattr(module, "current_user", None)
+    res = _run(module.webhook("agent-1"))
+    _assert_status(res, module.RetCode.UNAUTHORIZED, "Authentication required")
+
+    # Authenticated but not the canvas owner → 403.
+    monkeypatch.setattr(module, "current_user", SimpleNamespace(id="someone-else"))
+    monkeypatch.setattr(module.UserCanvasService, "query", lambda **_kwargs: [])
+    res = _run(module.webhook("agent-1"))
+    _assert_status(res, module.RetCode.FORBIDDEN, "Only the owner")
+
+    # Authenticated owner → proceeds past the gate; with allow_anonymous=True
+    # the rest of the pipeline returns 200.
+    monkeypatch.setattr(module, "current_user", SimpleNamespace(id="tenant-1"))
+    monkeypatch.setattr(module.UserCanvasService, "query", lambda **_kwargs: [object()])
+    cvs = _make_webhook_cvs(
+        module,
+        params=_default_webhook_params(security={"allow_anonymous": True}),
+    )
+    monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
+    res = _run(module.webhook("agent-1"))
+    assert hasattr(res, "status_code"), res
+    assert res.status_code == 200
+
+
+@pytest.mark.p2
+def test_webhook_anonymous_default_limits_apply(monkeypatch):
+    """allow_anonymous=true must still enforce a default body-size + rate limit."""
+    module = _load_agents_app(monkeypatch)
+    _patch_background_task(monkeypatch, module)
+
+    # Body larger than the 1MB anonymous default → rejected.
+    monkeypatch.setattr(
+        module,
+        "request",
+        _DummyRequest(
+            headers={"Content-Type": "application/json"},
+            json_body={},
+            content_length=2 * 1024 * 1024,
+        ),
+    )
+    cvs = _make_webhook_cvs(
+        module,
+        params=_default_webhook_params(security={"allow_anonymous": True}),
+    )
+    monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
+    _assert_bad_request(_run(module.webhook("agent-1")), "Request body too large")
+
+    # Default rate-limit token bucket denial → 400 (not a 401-auth failure).
+    monkeypatch.setattr(
+        module,
+        "request",
+        _DummyRequest(headers={"Content-Type": "application/json"}, json_body={}),
+    )
+    module.REDIS_CONN.bucket_result = [0]
+    module.REDIS_CONN.bucket_exc = None
+    cvs = _make_webhook_cvs(
+        module,
+        params=_default_webhook_params(security={"allow_anonymous": True}),
+    )
+    monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
+    _assert_bad_request(_run(module.webhook("agent-1")), "Too many requests")
+    module.REDIS_CONN.bucket_result = [1]
 
 
 @pytest.mark.p2
@@ -673,18 +782,18 @@ def test_webhook_max_body_size(monkeypatch):
     base_request = _DummyRequest(headers={"Content-Type": "application/json"}, json_body={})
     monkeypatch.setattr(module, "request", base_request)
 
-    cvs = _make_webhook_cvs(module, params=_default_webhook_params(security={"auth_type": "none"}))
+    cvs = _make_webhook_cvs(module, params=_default_webhook_params(security={"auth_type": "none", "allow_anonymous": True}))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
     res = _run(module.webhook("agent-1"))
     assert hasattr(res, "status_code")
     assert res.status_code == 200
 
-    security = {"auth_type": "none", "max_body_size": "123"}
+    security = {"auth_type": "none", "allow_anonymous": True, "max_body_size": "123"}
     cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=security))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
     _assert_bad_request(_run(module.webhook("agent-1")), "Invalid max_body_size format")
 
-    security = {"auth_type": "none", "max_body_size": "11mb"}
+    security = {"auth_type": "none", "allow_anonymous": True, "max_body_size": "11mb"}
     cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=security))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
     _assert_bad_request(_run(module.webhook("agent-1")), "exceeds maximum allowed size")
@@ -694,7 +803,7 @@ def test_webhook_max_body_size(monkeypatch):
         "request",
         _DummyRequest(headers={"Content-Type": "application/json"}, json_body={}, content_length=2048),
     )
-    security = {"auth_type": "none", "max_body_size": "1kb"}
+    security = {"auth_type": "none", "allow_anonymous": True, "max_body_size": "1kb"}
     cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=security))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
     _assert_bad_request(_run(module.webhook("agent-1")), "Request body too large")
@@ -712,14 +821,14 @@ def test_webhook_ip_whitelist(monkeypatch):
     )
 
     for whitelist in ([], ["127.0.0.0/24"], ["127.0.0.1"]):
-        security = {"auth_type": "none", "ip_whitelist": whitelist}
+        security = {"auth_type": "none", "allow_anonymous": True, "ip_whitelist": whitelist}
         cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=security))
         monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id, _cvs=cvs: (True, _cvs))
         res = _run(module.webhook("agent-1"))
         assert hasattr(res, "status_code"), res
         assert res.status_code == 200
 
-    security = {"auth_type": "none", "ip_whitelist": ["10.0.0.1"]}
+    security = {"auth_type": "none", "allow_anonymous": True, "ip_whitelist": ["10.0.0.1"]}
     cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=security))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
     _assert_bad_request(_run(module.webhook("agent-1")), "is not allowed")
@@ -732,25 +841,25 @@ def test_webhook_rate_limit(monkeypatch):
 
     monkeypatch.setattr(module, "request", _DummyRequest(headers={"Content-Type": "application/json"}, json_body={}))
 
-    cvs = _make_webhook_cvs(module, params=_default_webhook_params(security={"auth_type": "none"}))
+    cvs = _make_webhook_cvs(module, params=_default_webhook_params(security={"auth_type": "none", "allow_anonymous": True}))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
     res = _run(module.webhook("agent-1"))
     assert hasattr(res, "status_code")
     assert res.status_code == 200
 
-    bad_limit = {"auth_type": "none", "rate_limit": {"limit": 0, "per": "minute"}}
+    bad_limit = {"auth_type": "none", "allow_anonymous": True, "rate_limit": {"limit": 0, "per": "minute"}}
     cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=bad_limit))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
     _assert_bad_request(_run(module.webhook("agent-1")), "rate_limit.limit must be > 0")
 
-    bad_per = {"auth_type": "none", "rate_limit": {"limit": 1, "per": "week"}}
+    bad_per = {"auth_type": "none", "allow_anonymous": True, "rate_limit": {"limit": 1, "per": "week"}}
     cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=bad_per))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
     _assert_bad_request(_run(module.webhook("agent-1")), "Invalid rate_limit.per")
 
     module.REDIS_CONN.bucket_result = [0]
     module.REDIS_CONN.bucket_exc = None
-    denied = {"auth_type": "none", "rate_limit": {"limit": 1, "per": "minute"}}
+    denied = {"auth_type": "none", "allow_anonymous": True, "rate_limit": {"limit": 1, "per": "minute"}}
     cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=denied))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
     _assert_bad_request(_run(module.webhook("agent-1")), "Too many requests")
@@ -772,7 +881,7 @@ def test_webhook_token_basic_jwt_auth(monkeypatch):
     token_security = {"auth_type": "token", "token": {"token_header": "X-TOKEN", "token_value": "ok"}}
     cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=token_security))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
-    _assert_bad_request(_run(module.webhook("agent-1")), "Invalid token authentication")
+    _assert_status(_run(module.webhook("agent-1")), module.RetCode.UNAUTHORIZED, "Invalid token authentication")
 
     monkeypatch.setattr(
         module,
@@ -786,25 +895,25 @@ def test_webhook_token_basic_jwt_auth(monkeypatch):
     basic_security = {"auth_type": "basic", "basic_auth": {"username": "u", "password": "p"}}
     cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=basic_security))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
-    _assert_bad_request(_run(module.webhook("agent-1")), "Invalid Basic Auth credentials")
+    _assert_status(_run(module.webhook("agent-1")), module.RetCode.UNAUTHORIZED, "Invalid Basic Auth credentials")
 
     monkeypatch.setattr(module, "request", _DummyRequest(headers={"Content-Type": "application/json"}, json_body={}))
     jwt_missing_secret = {"auth_type": "jwt", "jwt": {}}
     cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=jwt_missing_secret))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
-    _assert_bad_request(_run(module.webhook("agent-1")), "JWT secret not configured")
+    _assert_status(_run(module.webhook("agent-1")), module.RetCode.UNAUTHORIZED, "JWT secret not configured")
 
     jwt_base = {"auth_type": "jwt", "jwt": {"secret": "secret"}}
     cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=jwt_base))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
-    _assert_bad_request(_run(module.webhook("agent-1")), "Missing Bearer token")
+    _assert_status(_run(module.webhook("agent-1")), module.RetCode.UNAUTHORIZED, "Missing Bearer token")
 
     monkeypatch.setattr(
         module,
         "request",
         _DummyRequest(headers={"Content-Type": "application/json", "Authorization": "Bearer   "}, json_body={}),
     )
-    _assert_bad_request(_run(module.webhook("agent-1")), "Empty Bearer token")
+    _assert_status(_run(module.webhook("agent-1")), module.RetCode.UNAUTHORIZED, "Empty Bearer token")
 
     monkeypatch.setattr(
         module,
@@ -812,19 +921,19 @@ def test_webhook_token_basic_jwt_auth(monkeypatch):
         _DummyRequest(headers={"Content-Type": "application/json", "Authorization": "Bearer token"}, json_body={}),
     )
     monkeypatch.setattr(module.jwt, "decode", lambda *_args, **_kwargs: (_ for _ in ()).throw(Exception("decode boom")))
-    _assert_bad_request(_run(module.webhook("agent-1")), "Invalid JWT")
+    _assert_status(_run(module.webhook("agent-1")), module.RetCode.UNAUTHORIZED, "Invalid JWT")
 
     monkeypatch.setattr(module.jwt, "decode", lambda *_args, **_kwargs: {"exp": 1})
     jwt_reserved = {"auth_type": "jwt", "jwt": {"secret": "secret", "required_claims": ["exp"]}}
     cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=jwt_reserved))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
-    _assert_bad_request(_run(module.webhook("agent-1")), "Reserved JWT claim cannot be required")
+    _assert_status(_run(module.webhook("agent-1")), module.RetCode.UNAUTHORIZED, "Reserved JWT claim cannot be required")
 
     monkeypatch.setattr(module.jwt, "decode", lambda *_args, **_kwargs: {})
     jwt_missing_claim = {"auth_type": "jwt", "jwt": {"secret": "secret", "required_claims": ["role"]}}
     cvs = _make_webhook_cvs(module, params=_default_webhook_params(security=jwt_missing_claim))
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
-    _assert_bad_request(_run(module.webhook("agent-1")), "Missing JWT claim")
+    _assert_status(_run(module.webhook("agent-1")), module.RetCode.UNAUTHORIZED, "Missing JWT claim")
 
     captured = {}
 
@@ -868,7 +977,7 @@ def test_webhook_parse_request_branches(monkeypatch):
     module = _load_agents_app(monkeypatch)
     _patch_background_task(monkeypatch, module)
 
-    security = {"auth_type": "none"}
+    security = {"auth_type": "none", "allow_anonymous": True}
     params = _default_webhook_params(security=security, content_types="application/json")
     cvs = _make_webhook_cvs(module, params=params)
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
@@ -934,7 +1043,7 @@ def test_webhook_parse_request_branches(monkeypatch):
 def test_webhook_canvas_constructor_exception(monkeypatch):
     module = _load_agents_app(monkeypatch)
 
-    params = _default_webhook_params(security={"auth_type": "none"})
+    params = _default_webhook_params(security={"auth_type": "none", "allow_anonymous": True})
     cvs = _make_webhook_cvs(module, params=params)
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
     monkeypatch.setattr(
@@ -1047,7 +1156,7 @@ def test_webhook_parse_request_form_and_raw_body_paths(monkeypatch):
     module = _load_agents_app(monkeypatch)
     _patch_background_task(monkeypatch, module)
 
-    security = {"auth_type": "none"}
+    security = {"auth_type": "none", "allow_anonymous": True}
 
     def _run_with(params, req):
         cvs = _make_webhook_cvs(module, params=params)
@@ -1136,7 +1245,7 @@ def test_webhook_schema_extract_cast_defaults_and_validation_errors(monkeypatch)
     }
 
     params = _default_webhook_params(
-        security={"auth_type": "none"},
+        security={"auth_type": "none", "allow_anonymous": True},
         content_types="application/json",
         schema=base_schema,
     )
@@ -1215,7 +1324,7 @@ def test_webhook_schema_extract_cast_defaults_and_validation_errors(monkeypatch)
 
     for schema, body_payload, expected_substring in failure_cases:
         params = _default_webhook_params(
-            security={"auth_type": "none"},
+            security={"auth_type": "none", "allow_anonymous": True},
             content_types="application/json",
             schema=schema,
         )
@@ -1237,7 +1346,7 @@ def test_webhook_immediate_response_status_and_template_validation(monkeypatch):
 
     def _run_case(response_cfg):
         params = _default_webhook_params(
-            security={"auth_type": "none"},
+            security={"auth_type": "none", "allow_anonymous": True},
             content_types="application/json",
             response=response_cfg,
         )
@@ -1268,6 +1377,9 @@ def test_webhook_immediate_response_status_and_template_validation(monkeypatch):
 @pytest.mark.p2
 def test_webhook_background_run_success_and_error_trace_paths(monkeypatch):
     module = _load_agents_app(monkeypatch)
+    # /webhook/test owner check: stubbed current_user is "tenant-1"; surface
+    # the canvas as owned by that user.
+    monkeypatch.setattr(module.UserCanvasService, "query", lambda **_kwargs: [object()])
 
     redis_store = {}
 
@@ -1300,7 +1412,7 @@ def test_webhook_background_run_success_and_error_trace_paths(monkeypatch):
 
     monkeypatch.setattr(module, "Canvas", _CanvasSuccess)
 
-    params = _default_webhook_params(security={"auth_type": "none"}, content_types="application/json")
+    params = _default_webhook_params(security={"auth_type": "none", "allow_anonymous": True}, content_types="application/json")
     cvs = _make_webhook_cvs(module, params=params)
     monkeypatch.setattr(module.UserCanvasService, "get_by_id", lambda _id: (True, cvs))
     monkeypatch.setattr(
@@ -1356,13 +1468,16 @@ def test_webhook_background_run_success_and_error_trace_paths(monkeypatch):
 @pytest.mark.p2
 def test_webhook_sse_success_and_exception_paths(monkeypatch):
     module = _load_agents_app(monkeypatch)
+    # /webhook/test owner check: stubbed current_user is "tenant-1"; surface
+    # the canvas as owned by that user.
+    monkeypatch.setattr(module.UserCanvasService, "query", lambda **_kwargs: [object()])
 
     redis_store = {}
     monkeypatch.setattr(module.REDIS_CONN, "get", lambda key: redis_store.get(key))
     monkeypatch.setattr(module.REDIS_CONN, "set_obj", lambda key, obj, _ttl: redis_store.__setitem__(key, json.dumps(obj)))
 
     params = _default_webhook_params(
-        security={"auth_type": "none"},
+        security={"auth_type": "none", "allow_anonymous": True},
         content_types="application/json",
         execution_mode="Deferred",
     )

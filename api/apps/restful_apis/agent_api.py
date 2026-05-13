@@ -1107,6 +1107,15 @@ async def webhook(agent_id: str):
     is_test = request.path.startswith(f"/api/v1/agents/{agent_id}/webhook/test")
     start_ts = time.time()
 
+    # /webhook/test is a development-time surface and must require an
+    # authenticated session bound to the canvas owner/tenant.
+    if is_test:
+        user = current_user
+        if not user:
+            return get_data_error_result(code=RetCode.UNAUTHORIZED, message="Authentication required."), RetCode.UNAUTHORIZED
+        if not UserCanvasService.query(user_id=user.id, id=agent_id):
+            return get_data_error_result(code=RetCode.FORBIDDEN, message="Only the owner of the agent is authorized to invoke /webhook/test."), RetCode.FORBIDDEN
+
     # 1. Fetch canvas by agent_id
     exists, cvs = UserCanvasService.get_by_id(agent_id)
     if not exists:
@@ -1141,11 +1150,39 @@ async def webhook(agent_id: str):
         ),RetCode.BAD_REQUEST
 
     # 6. Validate webhook security
+    #
+    # Secure-by-default: an empty security block (or auth_type == "none") is
+    # rejected unless the operator has explicitly set allow_anonymous: true.
+    # Even in the anonymous-allowed path a default body-size cap and rate
+    # limit are enforced so an open webhook cannot be abused for unbounded
+    # load on the tenant's LLM budget.
+    DEFAULT_ANON_MAX_BODY_SIZE = "1MB"
+    DEFAULT_ANON_RATE_LIMIT = {"limit": 60, "per": "minute"}
+
+    class WebhookAuthError(Exception):
+        pass
+
     async def validate_webhook_security(security_cfg: dict):
         """Validate webhook security rules based on security configuration."""
 
-        if not security_cfg:
-            return  # No security config → allowed by default
+        cfg = security_cfg or {}
+        auth_type = cfg.get("auth_type", "none")
+        allow_anonymous = bool(cfg.get("allow_anonymous"))
+
+        if not security_cfg or auth_type == "none":
+            if not allow_anonymous:
+                raise WebhookAuthError(
+                    "Webhook requires explicit security configuration: set "
+                    "'auth_type' (token/basic/jwt) or 'allow_anonymous: true' "
+                    "under the Begin component's webhook security block."
+                )
+            effective_cfg = dict(cfg)
+            effective_cfg.setdefault("max_body_size", DEFAULT_ANON_MAX_BODY_SIZE)
+            effective_cfg.setdefault("rate_limit", DEFAULT_ANON_RATE_LIMIT)
+            await _validate_max_body_size(effective_cfg)
+            _validate_ip_whitelist(effective_cfg)
+            _validate_rate_limit(effective_cfg)
+            return
 
         # 1. Validate max body size
         await _validate_max_body_size(security_cfg)
@@ -1153,26 +1190,23 @@ async def webhook(agent_id: str):
         # 2. Validate IP whitelist
         _validate_ip_whitelist(security_cfg)
 
-        # # 3. Validate rate limiting
+        # 3. Validate rate limiting
         _validate_rate_limit(security_cfg)
 
         # 4. Validate authentication
-        auth_type = security_cfg.get("auth_type", "none")
-
-        if auth_type == "none":
-            return
-
-        if auth_type == "token":
-            _validate_token_auth(security_cfg)
-
-        elif auth_type == "basic":
-            _validate_basic_auth(security_cfg)
-
-        elif auth_type == "jwt":
-            _validate_jwt_auth(security_cfg)
-
-        else:
-            raise Exception(f"Unsupported auth_type: {auth_type}")
+        try:
+            if auth_type == "token":
+                _validate_token_auth(security_cfg)
+            elif auth_type == "basic":
+                _validate_basic_auth(security_cfg)
+            elif auth_type == "jwt":
+                _validate_jwt_auth(security_cfg)
+            else:
+                raise WebhookAuthError(f"Unsupported auth_type: {auth_type}")
+        except WebhookAuthError:
+            raise
+        except Exception as e:
+            raise WebhookAuthError(str(e))
 
     async def _validate_max_body_size(security_cfg):
         """Check request size does not exceed max_body_size."""
@@ -1350,6 +1384,8 @@ async def webhook(agent_id: str):
     try:
         security_config=webhook_cfg.get("security", {})
         await validate_webhook_security(security_config)
+    except WebhookAuthError as e:
+        return get_data_error_result(code=RetCode.UNAUTHORIZED, message=str(e)), RetCode.UNAUTHORIZED
     except Exception as e:
         return get_data_error_result(code=RetCode.BAD_REQUEST,message=str(e)),RetCode.BAD_REQUEST
     if not isinstance(cvs.dsl, str):
